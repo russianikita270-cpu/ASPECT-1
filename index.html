@@ -30724,15 +30724,166 @@ if (location.protocol === 'file:') {
     state.speed = Math.max(0, num($('vpb-speed') && $('vpb-speed').value, 0));
     state.buckets.forEach((bucket, i) => {
       const current = $('vpb-current-' + i);
+      const bucketCapacity = $('vpb-capacity-' + i);
       const rate = $('vpb-rate-' + i);
       if (current && document.activeElement === current) bucket.currentKg = current.value;
+      if (bucketCapacity && document.activeElement === bucketCapacity) {
+        bucket.capacityKg = Math.max(0.1, num(bucketCapacity.value, capacity()));
+      } else {
+        bucket.capacityKg = Math.max(0.1, num(bucket.capacityKg, capacity()));
+      }
       if (rate && document.activeElement === rate) bucket.rateKgPer1000 = rate.value;
-      bucket.capacityKg = capacity();
     });
     save();
   }
   function input(id, value, attrs) {
     return `<input id="${id}" value="${esc(value)}" ${attrs || ''} class="vpb-input">`;
+  }
+  const VIRTUAL_BUCKET_COLORS = [
+    ['#f97316', '#9a3412'], ['#2563eb', '#1e3a8a'],
+    ['#16a34a', '#166534'], ['#a855f7', '#581c87'],
+    ['#e11d48', '#881337'], ['#0891b2', '#155e75'],
+    ['#ca8a04', '#713f12'], ['#64748b', '#1e293b']
+  ];
+  function bucketLevel(bucket) {
+    const hasReading = String(bucket.currentKg == null ? '' : bucket.currentKg).trim() !== '';
+    const current = Math.max(0, num(bucket.currentKg));
+    const cap = Math.max(0.1, num(bucket.capacityKg, capacity()));
+    const rate = Math.max(0, num(bucket.rateKgPer1000));
+    if (!hasReading) return { kind: 'empty', current, cap, rate };
+    if (current <= 0) return { kind: 'zero', current, cap, rate };
+    if (current > cap) return { kind: 'over', current, cap, rate };
+    const threshold = Math.max(rate * state.palletMeters / 1000, cap * 0.15);
+    return { kind: current <= threshold ? 'low' : 'normal', current, cap, rate };
+  }
+  function renderBuckets(m) {
+    const root = $('vpb-buckets');
+    if (!root) return;
+
+    /* Карточки и поля секций создаём только один раз. Повторный render()
+       вызывается каждую секунду и теперь меняет только содержимое уже
+       существующих узлов — активное поле не теряет фокус и введённый текст. */
+    if (root.querySelectorAll('.vpb-bucket').length !== state.buckets.length) {
+      root.innerHTML = state.buckets.map((b, i) => {
+        const visualWater = b.paintType === 'water';
+        const visualMax = visualWater ? 40 : 250;
+        const visualColors = VIRTUAL_BUCKET_COLORS[i % VIRTUAL_BUCKET_COLORS.length];
+        return `<div class="vpb-bucket" data-vpb-section="${i}">
+          <div class="vpb-visual-line">
+            <div class="vpb-visual-bucket ${visualWater ? 'vpb-water' : ''}" style="--vpb-fill:0%;--vpb-main:${visualColors[0]};--vpb-deep:${visualColors[1]}">
+              <div class="vpb-liquid"><span class="vpb-liquid-surface"></span><span class="vpb-shine"></span></div>
+              <div class="vpb-level-guide"></div>
+              <div class="vpb-level-scale" aria-hidden="true"><span>100</span><span>75</span><span>50</span><span>25</span><span>0</span></div>
+              <div class="vpb-bucket-mark">0 кг</div>
+              <div class="vpb-fill-label">КРАСКА</div>
+            </div>
+            <div class="vpb-visual-caption">
+              <b class="vpb-section-name">СЕКЦИЯ ${i + 1}</b>
+              <span class="vpb-bucket-reading"><strong class="vpb-bucket-kg">0</strong> кг из <span class="vpb-bucket-max">${visualMax}</span> кг</span>
+              <small class="vpb-paint-kind">${visualWater ? 'ВОДНАЯ КРАСКА' : 'ПЛАСТИЗОЛЬ'}</small>
+              <small class="vpb-level-text">0% уровня</small>
+            </div>
+          </div>
+          <div class="vpb-bucket-head"><b>Секция ${i + 1}</b><span></span></div>
+          <div class="vpb-bar"><i></i></div>
+          <div class="vpb-grid">
+            <label class="vpb-field"><span>Тип краски</span><select id="vpb-paint-${i}" class="vpb-input vpb-select" onchange="window.vpbChange(${i},'paintType',this.value)"><option value="plastisol">Пластизольная</option><option value="water">Водная</option></select></label>
+            <label class="vpb-field"><span>Остаток сейчас, кг</span>${input('vpb-current-' + i, b.currentKg, `type="number" min="0" step="0.1" max="${b.capacityKg || visualMax}" placeholder="Например, 25" oninput="window.vpbChange(${i},'currentKg',this.value)"`)}</label>
+            <label class="vpb-field"><span>Ёмкость секции, кг</span>${input('vpb-capacity-' + i, b.capacityKg, `type="number" min="0.1" step="0.1" placeholder="${b.capacityKg || visualMax}" oninput="window.vpbChange(${i},'capacityKg',this.value)"`)}</label>
+            <label class="vpb-field"><span>Расход нормы, кг/1000 м</span>${input('vpb-rate-' + i, b.rateKgPer1000, 'type="number" min="0" step="0.01" placeholder="Например, 3,1" oninput="window.vpbChange(' + i + ',\'rateKgPer1000\',this.value)"')}</label>
+          </div>
+          <div class="vpb-muted vpb-bucket-forecast"></div>
+          <div class="vpb-paper vpb-bucket-paper"></div>
+        </div>`;
+      }).join('');
+    }
+
+    state.buckets.forEach((b, i) => {
+      const row = root.children[i];
+      if (!row) return;
+      const levelState = bucketLevel(b);
+      const current = levelState.current;
+      const cap = levelState.cap;
+      const rate = levelState.rate;
+      const hours = state.speed > 0 && rate > 0 ? current / rate * 1000 / state.speed / 60 : null;
+      const paintPerRoll = rate > 0 ? rate * state.rollLength / 1000 : null;
+      const cumulativePaintPerRoll = m.paintBySection.slice(0, i + 1).reduce((sum, item) => sum + item.kgPerRoll, 0);
+      const finishedAfterSectionKg = m.rollKg + cumulativePaintPerRoll;
+      const paintPerPaperKg = rate > 0 && m.paperKgPer1000m > 0 ? rate / m.paperKgPer1000m : null;
+      const pct = Math.max(0, Math.min(100, current / cap * 100));
+      const low = levelState.kind === 'low';
+      const zero = levelState.kind === 'zero';
+      const over = levelState.kind === 'over';
+      const visualWater = b.paintType === 'water';
+      const visualMax = cap;
+      const visualPct = Math.max(0, Math.min(100, current / visualMax * 100));
+      const visualColors = VIRTUAL_BUCKET_COLORS[i % VIRTUAL_BUCKET_COLORS.length];
+      const visual = row.querySelector('.vpb-visual-bucket');
+
+      row.classList.toggle('vpb-low', low);
+      row.classList.toggle('vpb-zero', zero);
+      row.classList.toggle('vpb-over', over);
+      const paintSelect = $('vpb-paint-' + i);
+      if (paintSelect && document.activeElement !== paintSelect) paintSelect.value = b.paintType;
+      const currentInput = $('vpb-current-' + i);
+      if (currentInput) currentInput.max = cap;
+      syncInput('vpb-current-' + i, b.currentKg);
+      syncInput('vpb-capacity-' + i, b.capacityKg);
+      syncInput('vpb-rate-' + i, b.rateKgPer1000);
+
+      const headStatus = row.querySelector('.vpb-bucket-head span');
+      const levelLabel = zero ? '⛔ Расход остановлен' : over ? '⚠️ Выше ёмкости' : low ? '⚠️ Низкий остаток' : levelState.kind === 'empty' ? 'ℹ️ Остаток не задан' : '✅';
+      if (headStatus) headStatus.textContent = `${b.paintType === 'water' ? '💧 Водная' : '🎨 Пластизольная'} · ${round(current, 2)} / ${round(cap, 2)} кг · ${levelLabel}`;
+      const bar = row.querySelector('.vpb-bar i');
+      if (bar) bar.style.width = pct + '%';
+      const forecast = row.querySelector('.vpb-bucket-forecast');
+      if (forecast) forecast.textContent = zero
+        ? 'Остаток 0 кг — расход по этой секции остановлен, отрицательное значение не допускается.'
+        : over
+        ? `Проверьте ввод: остаток ${round(current, 2)} кг больше ёмкости ${round(cap, 2)} кг.`
+        : hours == null
+        ? 'Заполните оба поля и скорость сверху — тогда появится прогноз.'
+        : `Остатка примерно на ${round(hours, 1)} ч · ${round(rate * state.palletMeters / 1000, 2)} кг/палету`;
+      const paper = row.querySelector('.vpb-bucket-paper');
+      if (paper) paper.innerHTML = `Расход: <b>${rate ? round(rate, 3) + ' кг/1000 м' : 'норма не задана'}</b>${paintPerRoll != null ? ` · <b>${round(paintPerRoll, 3)} кг/рулон</b>` : ''}${paintPerPaperKg != null ? ` · ${round(paintPerPaperKg * 1000, 1)} г краски/кг бумаги` : ''} · после С${i + 1}: <b>${round(finishedAfterSectionKg, 3)} кг/рулон</b>`;
+
+      if (visual) {
+        visual.style.setProperty('--vpb-fill', visualPct + '%');
+        visual.style.setProperty('--vpb-main', visualColors[0]);
+        visual.style.setProperty('--vpb-deep', visualColors[1]);
+        visual.classList.toggle('vpb-water', visualWater);
+        visual.classList.toggle('vpb-running', state.running);
+        visual.classList.toggle('vpb-paused', !state.running);
+        visual.classList.toggle('vpb-visual-low', low);
+        visual.classList.toggle('vpb-visual-zero', zero);
+        visual.classList.toggle('vpb-visual-over', over);
+        const mark = visual.querySelector('.vpb-bucket-mark');
+        if (mark) mark.textContent = `${round(current, 2)} кг`;
+        const kg = row.querySelector('.vpb-bucket-kg');
+        const max = row.querySelector('.vpb-bucket-max');
+        const kind = row.querySelector('.vpb-paint-kind');
+        const level = row.querySelector('.vpb-level-text');
+        if (kg) kg.textContent = round(current, 2);
+        if (max) max.textContent = round(visualMax, 2);
+        if (kind) kind.textContent = visualWater ? 'ВОДНАЯ КРАСКА' : 'ПЛАСТИЗОЛЬ';
+        if (level) level.textContent = `${Math.round(visualPct)}% уровня${zero ? ' · РАСХОД ОСТАНОВЛЕН' : over ? ' · ВЫШЕ ЁМКОСТИ' : low ? ' · МАЛО' : levelState.kind === 'empty' ? ' · НЕ УКАЗАНО' : ''}`;
+      }
+    });
+  }
+  function renderEvents() {
+    const root = $('vpb-events');
+    if (!root) return;
+    const visibleEvents = events.slice(0, 12);
+    const signature = visibleEvents.map(event =>
+      `${event.id}:${event.pending ? 'pending' : 'saved'}:${event.savedAt || ''}`
+    ).join('|');
+    /* Во время ввода фактического расхода значения живут в DOM-полях.
+       Не заменяем журнал, если сами события не изменились. */
+    if (root.dataset.vpbEventsSignature === signature) return;
+    root.dataset.vpbEventsSignature = signature;
+    root.innerHTML = visibleEvents.length
+      ? visibleEvents.map(eventHtml).join('')
+      : '<div class="vpb-muted">После первой палеты здесь появится журнал фактического расхода.</div>';
   }
   function render() {
      /* В модуле не было отдельного vpb-root: из-за этого render() сразу
@@ -30761,8 +30912,10 @@ if (location.protocol === 'file:') {
       if (!activeBlock && !lockBusy && /Линия .*занят|Линия .*запущен|запуск не начат/i.test(alertText)) {
         alertText = '';
       }
-     $('vpb-status').innerHTML = state.running
-       ? `<span class="vpb-dot"></span> Идёт расчёт · ${round(state.palletProgress, 1)} / ${round(state.palletMeters, 1)} м`
+     $('vpb-status').innerHTML = state.running && !(state.speed > 0)
+       ? `<span class="vpb-status-warning">⚠️ Расчёт запущен, но скорость 0 — расход не списывается</span>`
+       : state.running
+         ? `<span class="vpb-dot"></span> Идёт расчёт · ${round(state.palletProgress, 1)} / ${round(state.palletMeters, 1)} м`
        : activeBlock
          ? `🔒 Линия занята · запустил ${esc(lockLabel(activeBlock))}`
          : lockBusy
@@ -30802,61 +30955,37 @@ if (location.protocol === 'file:') {
      $('vpb-start').className = 'vpb-btn ' + (state.running ? 'vpb-btn-pause' : activeBlock ? 'vpb-btn-locked' : 'vpb-btn-primary');
      $('vpb-start').disabled = !!lockBusy || !!activeBlock;
 
-    $('vpb-buckets').innerHTML = state.buckets.map((b, i) => {
-      const current = Math.max(0, num(b.currentKg));
-      const cap = b.capacityKg || capacity();
-      const rate = Math.max(0, num(b.rateKgPer1000));
-      const hours = state.speed > 0 && rate > 0 ? current / rate * 1000 / state.speed / 60 : null;
-      const paintPerRoll = rate > 0 ? rate * state.rollLength / 1000 : null;
-       const cumulativePaintPerRoll = m.paintBySection.slice(0, i + 1).reduce((sum, item) => sum + item.kgPerRoll, 0);
-       const finishedAfterSectionKg = m.rollKg + cumulativePaintPerRoll;
-      const paintPerPaperKg = rate > 0 && m.paperKgPer1000m > 0 ? rate / m.paperKgPer1000m : null;
-      const pct = Math.max(0, Math.min(100, current / cap * 100));
-      const low = current <= Math.max(rate * state.palletMeters / 1000, cap * 0.15);
-       const visualWater = b.paintType === 'water';
-       const visualMax = visualWater ? 40 : 250;
-       const visualPct = Math.max(0, Math.min(100, current / visualMax * 100));
-       const visualColors = [
-         ['#f97316', '#9a3412'], ['#2563eb', '#1e3a8a'],
-         ['#16a34a', '#166534'], ['#a855f7', '#581c87'],
-         ['#e11d48', '#881337'], ['#0891b2', '#155e75'],
-         ['#ca8a04', '#713f12'], ['#64748b', '#1e293b']
-       ][i % 8];
-      return `<div class="vpb-bucket ${low ? 'vpb-low' : ''}">
-          <div class="vpb-visual-line">
-            <div class="vpb-visual-bucket ${visualWater ? 'vpb-water' : ''} ${visualPct <= 15 ? 'vpb-visual-low' : ''}" style="--vpb-fill:${visualPct}%;--vpb-main:${visualColors[0]};--vpb-deep:${visualColors[1]}">
-              <div class="vpb-liquid"><span class="vpb-liquid-surface"></span><span class="vpb-shine"></span></div>
-              <div class="vpb-level-guide"></div>
-              <div class="vpb-level-scale" aria-hidden="true"><span>100</span><span>75</span><span>50</span><span>25</span><span>0</span></div>
-              <div class="vpb-bucket-mark">${round(current, 2)} кг</div>
-              <div class="vpb-fill-label">КРАСКА</div>
-            </div>
-            <div class="vpb-visual-caption">
-              <b class="vpb-section-name">СЕКЦИЯ ${i + 1}</b>
-              <span class="vpb-bucket-reading"><strong class="vpb-bucket-kg">${round(current, 2)}</strong> кг из <span class="vpb-bucket-max">${visualMax}</span> кг</span>
-              <small class="vpb-paint-kind">${visualWater ? 'ВОДНАЯ КРАСКА' : 'ПЛАСТИЗОЛЬ'}</small>
-              <small class="vpb-level-text">${Math.round(visualPct)}% уровня${visualPct <= 15 ? ' · МАЛО' : ''}</small>
-            </div>
-          </div>
-         <div class="vpb-bucket-head"><b>Секция ${i + 1}</b><span>${b.paintType === 'water' ? '💧 Водная' : '🎨 Пластизольная'} · ${round(current, 2)} / ${cap} кг ${low ? '⚠️' : '✅'}</span></div>
-        <div class="vpb-bar"><i style="width:${pct}%"></i></div>
-         <div class="vpb-grid">
-           <label class="vpb-field"><span>Тип краски</span><select id="vpb-paint-${i}" class="vpb-input vpb-select" onchange="window.vpbChange(${i},'paintType',this.value)"><option value="plastisol" ${b.paintType === 'plastisol' ? 'selected' : ''}>Пластизольная</option><option value="water" ${b.paintType === 'water' ? 'selected' : ''}>Водная</option></select></label>
-           <label class="vpb-field"><span>Остаток сейчас, кг</span>${input('vpb-current-' + i, b.currentKg, `type="number" min="0" step="0.1" max="${cap}" placeholder="Например, 25" oninput="window.vpbChange(${i},'currentKg',this.value)"`)}</label>
-           <label class="vpb-field"><span>Ёмкость секции, кг</span>${input('vpb-capacity-' + i, b.capacityKg, `type="number" min="0.1" step="0.1" placeholder="${cap}" oninput="window.vpbChange(${i},'capacityKg',this.value)"`)}</label>
-           <label class="vpb-field"><span>Расход нормы, кг/1000 м</span>${input('vpb-rate-' + i, b.rateKgPer1000, 'type="number" min="0" step="0.01" placeholder="Например, 3,1" oninput="window.vpbChange(' + i + ',\'rateKgPer1000\',this.value)"')}</label>
-        </div>
-         <div class="vpb-muted">${hours == null ? 'Заполните оба поля и скорость сверху — тогда появится прогноз.' : `Остатка примерно на ${round(hours, 1)} ч · ${round(rate * state.palletMeters / 1000, 2)} кг/палету`}</div>
-          <div class="vpb-paper">Расход: <b>${rate ? round(rate, 3) + ' кг/1000 м' : 'норма не задана'}</b>${paintPerRoll != null ? ` · <b>${round(paintPerRoll, 3)} кг/рулон</b>` : ''}${paintPerPaperKg != null ? ` · ${round(paintPerPaperKg * 1000, 1)} г краски/кг бумаги` : ''} · после С${i + 1}: <b>${round(finishedAfterSectionKg, 3)} кг/рулон</b></div>
-      </div>`;
-    }).join('');
+     renderBuckets(m);
+     const zeroSections = state.buckets
+       .map((b, i) => bucketLevel(b).kind === 'zero' ? i + 1 : null)
+       .filter(Boolean);
+     const lowSections = state.buckets
+       .map((b, i) => bucketLevel(b).kind === 'low' ? i + 1 : null)
+       .filter(Boolean);
+     const overSections = state.buckets
+       .map((b, i) => bucketLevel(b).kind === 'over' ? i + 1 : null)
+       .filter(Boolean);
+     const levelAlert = $('vpb-level-alert');
+     if (levelAlert) {
+       levelAlert.className = 'vpb-level-alert ' + (zeroSections.length ? 'vpb-level-alert-danger' : (lowSections.length || overSections.length) ? 'vpb-level-alert-warning' : 'vpb-hidden');
+       levelAlert.innerHTML = zeroSections.length
+         ? `⛔ <b>Расход остановлен:</b> пустые секции — ${zeroSections.map(section => 'С' + section).join(', ')}. Пополните ёмкость перед продолжением.`
+         : overSections.length
+           ? `⚠️ <b>Проверьте ёмкость:</b> остаток выше заданной ёмкости в секциях — ${overSections.map(section => 'С' + section).join(', ')}.`
+         : lowSections.length
+           ? `⚠️ <b>Низкий остаток:</b> проверьте секции — ${lowSections.map(section => 'С' + section).join(', ')}.`
+           : '';
+     }
 
-    $('vpb-events').innerHTML = events.length ? events.slice(0, 12).map(eventHtml).join('') :
-      '<div class="vpb-muted">После первой палеты здесь появится журнал фактического расхода.</div>';
+     renderEvents();
   }
   function eventHtml(event) {
     const actual = event.actualKg || {};
     const estimated = event.estimatedKg || {};
+    const snapshot = Array.isArray(event.bucketSnapshot) ? event.bucketSnapshot : [];
+    const snapshotText = snapshot.map(bucket =>
+      `С${bucket.section}: ${round(num(bucket.currentKg), 2)} кг`
+    ).join(' · ');
     const fields = state.buckets.map((b, i) =>
       `<label class="vpb-event-field">С${i + 1}
         <input id="vpb-event-${event.id}-${i}" type="number" min="0" step="0.01"
@@ -30866,11 +30995,45 @@ if (location.protocol === 'file:') {
     return `<div class="vpb-event ${event.pending ? 'vpb-event-pending' : ''}">
       <div class="vpb-event-top"><b>Палета №${event.pallet}</b><span>${stamp(event.ts)}</span></div>
       <div class="vpb-muted">${event.line ? esc(event.line) + ' · ' : ''}${esc(event.article || 'без артикула')} · расчёт ${event.auto ? 'автоматический' : 'ручной'}</div>
+      ${snapshotText ? `<div class="vpb-muted">Снимок после палеты · ${round(num(event.speedAtPallet), 1)} м/мин: ${snapshotText}</div>` : ''}
       <div class="vpb-event-grid">${fields}</div>
       ${event.pending
         ? `<button class="vpb-btn vpb-btn-small vpb-btn-primary" onclick="window.vpbSaveEvent('${event.id}')">✅ Сохранить фактический расход</button>`
         : `<div class="vpb-muted">Фактически отмечено: ${Object.values(actual).filter(v => v !== '' && v != null).length} секций</div>`}
+      ${eventAnalysisHtml(event)}
     </div>`;
+  }
+  function eventAnalysisHtml(event) {
+    if (event.pending) return '';
+    const actual = event.actualKg || {};
+    const estimated = event.estimatedKg || {};
+    const snapshot = Array.isArray(event.bucketSnapshot) ? event.bucketSnapshot : [];
+    const learned = event.learnedRateKgPer1000m || {};
+    const meters = Math.max(0, num(event.palletMetersAtPallet, state.palletMeters));
+    const rows = state.buckets.map((bucket, i) => {
+      const actualRaw = actual[i] == null ? '' : String(actual[i]).trim();
+      if (!actualRaw) return '';
+      const actualKg = Math.max(0, num(actualRaw));
+      const estimatedKg = Math.max(0, num(estimated[i]));
+      const deltaKg = actualKg - estimatedKg;
+      const deltaPct = estimatedKg > 0 ? deltaKg / estimatedKg * 100 : null;
+      const actualRate = meters > 0 ? actualKg * 1000 / meters : 0;
+      const learnedRate = num(learned[i], actualRate);
+      const notable = deltaPct != null && Math.abs(deltaPct) > 10;
+      const snapshotBucket = snapshot[i];
+      const afterKg = snapshotBucket ? num(snapshotBucket.currentKg) : null;
+      return `<div class="vpb-analysis-row ${notable ? 'vpb-analysis-warn' : ''}">
+        <b>С${i + 1}</b>
+        <span>после: <strong>${afterKg == null ? '—' : round(afterKg, 2) + ' кг'}</strong></span>
+        <span>прогноз: <strong>${round(estimatedKg, 2)} кг</strong></span>
+        <span>факт: <strong>${round(actualKg, 2)} кг</strong></span>
+        <span>Δ: <strong>${deltaPct == null ? '—' : (deltaKg >= 0 ? '+' : '') + round(deltaKg, 2) + ' кг (' + (deltaPct >= 0 ? '+' : '') + round(deltaPct, 1) + '%)'}</strong></span>
+        <span>норма: <strong>${learnedRate > 0 ? round(learnedRate, 3) + ' кг/1000 м' : '—'}</strong></span>
+      </div>`;
+    }).join('');
+    return rows
+      ? `<div class="vpb-analysis"><div class="vpb-analysis-title">📊 Сверка прогноза и факта</div>${rows}</div>`
+      : '';
   }
   function notifyPallet(pallet) {
     alertText = `🔔 Палета №${pallet} собрана. Печатнику нужно записать расход краски по секциям.`;
@@ -30899,7 +31062,16 @@ if (location.protocol === 'file:') {
     const event = {
       id: String(now()) + Math.random().toString(16).slice(2),
       ts: now(), pallet, line: state.line || getLine(), article: state.article,
-      auto: !!auto, pending: true, estimatedKg, actualKg: {}
+      auto: !!auto, pending: true, estimatedKg, actualKg: {},
+      speedAtPallet: round(state.speed, 2),
+      palletMetersAtPallet: round(state.palletMeters, 2),
+      bucketSnapshot: state.buckets.map(bucket => ({
+        section: bucket.section,
+        currentKg: round(Math.max(0, num(bucket.currentKg)), 3),
+        capacityKg: round(Math.max(0.1, num(bucket.capacityKg, capacity())), 3),
+        rateKgPer1000: round(Math.max(0, num(bucket.rateKgPer1000)), 3),
+        paintType: bucket.paintType
+      }))
     };
     events.unshift(event);
     state.pendingPallet = true;
@@ -30930,7 +31102,10 @@ if (location.protocol === 'file:') {
     }
     const t = now();
     if (!state.lastTickAt) state.lastTickAt = t;
-    const deltaMinutes = Math.max(0, Math.min(5, (t - state.lastTickAt) / 60000));
+    /* Таймер нужен только как будильник. Если вкладка была скрыта и
+       браузер замедлил callbacks, списываем весь реально прошедший
+       интервал, а не максимум одного-двух срабатываний. */
+    const deltaMinutes = Math.max(0, (t - state.lastTickAt) / 60000);
     const meters = state.speed * deltaMinutes;
     if (meters > 0) {
       state.buckets.forEach(b => {
@@ -30961,6 +31136,14 @@ if (location.protocol === 'file:') {
        return;
      }
      if (lockBusy) return;
+      const overCapacitySections = state.buckets
+        .map((bucket, index) => bucketLevel(bucket).kind === 'over' ? index + 1 : null)
+        .filter(Boolean);
+      if (overCapacitySections.length) {
+        alertText = `Перед запуском исправьте остаток выше ёмкости в секциях: ${overCapacitySections.map(section => 'С' + section).join(', ')}.`;
+        render();
+        return;
+      }
      if (!(state.speed > 0)) {
        alertText = 'Для отдельного запуска укажите скорость в поле «Скорость, м/мин». Без неё программа не может списывать расход по времени.';
        render();
@@ -31045,13 +31228,17 @@ if (location.protocol === 'file:') {
       actual[i] = el ? el.value : '';
     });
     event.actualKg = actual; event.pending = false; event.savedAt = now();
+    event.learnedRateKgPer1000m = {};
+    const eventMeters = Math.max(0.1, num(event.palletMetersAtPallet, state.palletMeters));
     const supplied = Object.entries(actual).filter(([, value]) => num(value) > 0);
     supplied.forEach(([index, value]) => {
       const kg = num(value);
-      if (kg > 0 && state.palletMeters > 0) {
+      if (kg > 0 && eventMeters > 0) {
         const old = num(state.buckets[index].rateKgPer1000);
-        const learned = kg * 1000 / state.palletMeters;
-        state.buckets[index].rateKgPer1000 = String(round(old ? old * 0.4 + learned * 0.6 : learned, 3));
+        const learned = kg * 1000 / eventMeters;
+        const nextRate = round(old ? old * 0.4 + learned * 0.6 : learned, 3);
+        state.buckets[index].rateKgPer1000 = String(nextRate);
+        event.learnedRateKgPer1000[index] = nextRate;
       }
     });
     state.pendingPallet = events.some(e => e.pending);
@@ -31158,7 +31345,10 @@ if (location.protocol === 'file:') {
     .vpb-status{font-size:11px;font-weight:900;color:#0f766e;display:flex;align-items:center;gap:6px}.vpb-dot{width:8px;height:8px;border-radius:50%;background:#10b981;display:inline-block;animation:vpbPulse 1s infinite}@keyframes vpbPulse{50%{opacity:.25}}
     .vpb-progress{height:10px;background:#e2e8f0;border-radius:99px;overflow:hidden;margin-top:8px}.vpb-progress i{display:block;height:100%;background:linear-gradient(90deg,#14b8a6,#0f766e);border-radius:99px;transition:width .3s}.vpb-progress-label{font-size:10px;color:#64748b;font-weight:800;margin-top:4px}
     .vpb-alert{background:#fef2f2;border:1px solid #fca5a5;color:#b91c1c;border-radius:13px;padding:10px;font-size:11px;font-weight:900;margin-top:10px}.vpb-bucket{border:1px solid #e2e8f0;border-radius:14px;padding:10px;margin-top:8px}.vpb-bucket.vpb-low{border-color:#fca5a5;background:#fffafa}.vpb-bucket-head,.vpb-event-top{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:11px}.vpb-bar{height:7px;background:#e2e8f0;border-radius:99px;overflow:hidden;margin:7px 0}.vpb-bar i{display:block;height:100%;background:#14b8a6;border-radius:99px}.vpb-low .vpb-bar i{background:#ef4444}.vpb-muted{font-size:10px;color:#64748b;line-height:1.4;margin-top:5px}.vpb-paper{background:#ecfeff;border:1px solid #a5f3fc;color:#155e75;border-radius:12px;padding:9px;font-size:10px;line-height:1.45;margin-top:8px}.vpb-section-title{font-size:11px;font-weight:950;text-transform:uppercase;letter-spacing:.04em;color:#334155}.vpb-event{border:1px solid #e2e8f0;border-radius:14px;padding:10px;margin-top:8px;background:#fff}.vpb-event-pending{border-color:#fca5a5;background:#fff7f7}.vpb-event-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:8px}.vpb-event-field{font-size:9px;color:#64748b;font-weight:900}.vpb-event-field input{margin-top:3px;padding:7px 5px;font-size:10px}.vpb-select{appearance:auto}
-     @media(max-width:560px){#vpb-fab{right:10px;bottom:calc(124px + env(safe-area-inset-bottom))}.vpb-config{grid-template-columns:repeat(2,minmax(0,1fr))}.vpb-event-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.vpb-event-field input{font-size:9px;padding:7px 3px}.vpb-title{font-size:16px}.vpb-grid{grid-template-columns:1fr}.vpb-actions .vpb-btn{flex:1}}
+    .vpb-level-alert{border-radius:13px;padding:10px;font-size:11px;font-weight:900;margin-top:10px}.vpb-level-alert-warning{background:#fefce8;border:1px solid #facc15;color:#854d0e}.vpb-level-alert-danger{background:#fef2f2;border:1px solid #f87171;color:#b91c1c}.vpb-bucket.vpb-low{border-color:#facc15;background:#fffdf2}.vpb-bucket.vpb-zero{border-color:#f87171;background:#fff7f7}.vpb-low .vpb-bar i{background:#eab308}.vpb-zero .vpb-bar i{background:#ef4444}.vpb-visual-low{--vpb-main:#eab308!important;--vpb-deep:#a16207!important;border-color:#eab308!important;box-shadow:0 0 0 3px #fef08a99,0 7px 13px #0f172a18!important}.vpb-visual-low .vpb-level-guide:after{background:#fef9c3;color:#854d0e}.vpb-visual-zero{--vpb-main:#ef4444!important;--vpb-deep:#991b1b!important;border-color:#ef4444!important;box-shadow:0 0 0 3px #fecaca99,0 7px 13px #0f172a18!important}.vpb-visual-zero .vpb-level-guide:after{background:#fee2e2;color:#991b1b}
+    .vpb-status-warning{color:#a16207}.vpb-bucket.vpb-over{border-color:#f59e0b;background:#fffaf0}.vpb-over .vpb-bar i{background:#f59e0b}.vpb-visual-over{--vpb-main:#f59e0b!important;--vpb-deep:#b45309!important;border-color:#f59e0b!important;box-shadow:0 0 0 3px #fde68a99,0 7px 13px #0f172a18!important}.vpb-visual-over .vpb-level-guide:after{background:#fef3c7;color:#92400e}
+    .vpb-analysis{margin-top:10px;border-top:1px solid #e2e8f0;padding-top:9px}.vpb-analysis-title{font-size:10px;font-weight:950;color:#334155;margin-bottom:6px}.vpb-analysis-row{display:grid;grid-template-columns:34px repeat(5,minmax(0,1fr));gap:5px;align-items:center;padding:6px 7px;border:1px solid #dcfce7;background:#f0fdf4;border-radius:9px;margin-top:4px;font-size:9px;color:#475569}.vpb-analysis-row strong{color:#0f172a}.vpb-analysis-warn{border-color:#facc15;background:#fefce8}.vpb-analysis-warn strong{color:#92400e}
+    @media(max-width:560px){#vpb-fab{right:10px;bottom:calc(124px + env(safe-area-inset-bottom))}.vpb-config{grid-template-columns:repeat(2,minmax(0,1fr))}.vpb-event-grid{grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.vpb-event-field input{font-size:9px;padding:7px 3px}.vpb-title{font-size:16px}.vpb-grid{grid-template-columns:1fr}.vpb-actions .vpb-btn{flex:1}}
   `;
   document.head.appendChild(style);
 
@@ -31179,7 +31369,7 @@ if (location.protocol === 'file:') {
       </div>
        <div class="vpb-actions"><button id="vpb-start" type="button" class="vpb-btn vpb-btn-primary" onclick="window.vpbStartPause()">▶ Запустить</button><button type="button" class="vpb-btn vpb-btn-muted" onclick="window.vpbFinishPallet()">✅ Палета готова</button><button type="button" class="vpb-btn vpb-btn-danger" onclick="window.vpbReset()">Сбросить прогресс</button></div>
         <div class="vpb-quickstart"><b>Как начать:</b> укажите скорость сверху → в каждой секции выберите «Пластизольная» или «Водная», внесите остаток и норму расхода → нажмите «▶ Запустить». Масса готового рулона считается как масса бумаги плюс краска всех секций. Расчёт запускается самостоятельно и не требует нажатия «Линия поехала» — эта кнопка только может подставить линию, артикул и скорость. <b>Ручной расчёт хранится отдельно в этой панели.</b></div>
-      <div id="vpb-status" class="vpb-status" style="margin-top:10px">⏸ Расчёт остановлен</div><div class="vpb-progress"><i id="vpb-progress" style="width:0%"></i></div><div id="vpb-progress-label" class="vpb-progress-label">0% · палет готово: 0</div><div id="vpb-alert" class="vpb-alert vpb-hidden"></div>
+      <div id="vpb-status" class="vpb-status" style="margin-top:10px">⏸ Расчёт остановлен</div><div class="vpb-progress"><i id="vpb-progress" style="width:0%"></i></div><div id="vpb-progress-label" class="vpb-progress-label">0% · палет готово: 0</div><div id="vpb-alert" class="vpb-alert vpb-hidden"></div><div id="vpb-level-alert" class="vpb-level-alert vpb-hidden"></div>
     </div>
        <div class="vpb-card vpb-buckets-card"><div class="vpb-section-title">🪣 1. Виртуальные ведра — остаток по секциям, всего <b id="vpb-total">0 кг</b></div><div class="vpb-muted">Для каждой секции отдельно укажите текущий остаток, её ёмкость и норму расхода. Если во второй секции краски больше, впишите её фактический вес — программа не будет приравнивать её к первой.</div><div id="vpb-buckets"></div></div>
      <div class="vpb-card"><div class="vpb-section-title">📐 2. Бумага и палета</div><div class="vpb-config" style="margin-top:8px">
@@ -31199,13 +31389,17 @@ if (location.protocol === 'file:') {
     if (e.target && formIds.indexOf(e.target.id) >= 0) updateStateFromForm();
   });
   modal.addEventListener('change', e => {
-    if (e.target && (formIds.indexOf(e.target.id) >= 0 || /^vpb-(current|rate)-\d+$/.test(e.target.id))) {
+    if (e.target && (formIds.indexOf(e.target.id) >= 0 || /^vpb-(current|capacity|rate)-\d+$/.test(e.target.id))) {
       updateStateFromForm();
       render();
     }
   });
   tickTimer = setInterval(tick, 1000);
   setInterval(syncRunLock, 4500);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) tick();
+  });
+  window.addEventListener('pageshow', () => tick());
   window.addEventListener('storage', e => {
     if (e.key === RUN_LOCKS_KEY) render();
   });
@@ -31438,9 +31632,15 @@ if (location.protocol === 'file:') {
        const sectionType = document.getElementById('vpb-paint-' + index);
        const water = sectionType && sectionType.value === 'water';
       const currentEl = document.getElementById('vpb-current-' + index);
-      const current = Math.max(0, parseFloat(String(currentEl && currentEl.value || '').replace(',', '.')) || 0);
-      const max = water ? 40 : 250;
+      const rawCurrent = String(currentEl && currentEl.value || '');
+      const hasReading = rawCurrent.trim() !== '';
+      const current = Math.max(0, parseFloat(rawCurrent.replace(',', '.')) || 0);
+      const zero = hasReading && current <= 0;
+       const capacityInput = document.getElementById('vpb-capacity-' + index);
+       const parsedCapacity = parseFloat(String(capacityInput && capacityInput.value || '').replace(',', '.'));
+       const max = Number.isFinite(parsedCapacity) && parsedCapacity > 0 ? parsedCapacity : (water ? 40 : 250);
       const percent = Math.max(0, Math.min(100, current / max * 100));
+      const over = hasReading && current > max;
       const colors = [
         ['#f97316', '#9a3412'], ['#2563eb', '#1e3a8a'],
         ['#16a34a', '#166534'], ['#a855f7', '#581c87'],
@@ -31473,7 +31673,9 @@ if (location.protocol === 'file:') {
       visual.classList.toggle('vpb-water', water);
       visual.classList.toggle('vpb-running', running);
        visual.classList.toggle('vpb-paused', !running);
-      visual.classList.toggle('vpb-visual-low', percent <= 15);
+      visual.classList.toggle('vpb-visual-low', !zero && hasReading && percent <= 15);
+      visual.classList.toggle('vpb-visual-zero', zero);
+      visual.classList.toggle('vpb-visual-over', over);
       const mark = visual.querySelector('.vpb-bucket-mark');
       if (mark) mark.textContent = `${Math.round(current * 100) / 100} кг`;
       const kg = visual.parentElement.querySelector('.vpb-bucket-kg');
@@ -31483,7 +31685,7 @@ if (location.protocol === 'file:') {
       if (kg) kg.textContent = Math.round(current * 100) / 100;
       if (maxEl) maxEl.textContent = max;
        if (kind) kind.textContent = water ? 'ВОДНАЯ КРАСКА' : 'ПЛАСТИЗОЛЬ';
-      if (level) level.textContent = `${Math.round(percent)}% уровня${percent <= 15 ? ' · МАЛО' : ''}`;
+       if (level) level.textContent = `${Math.round(percent)}% уровня${zero ? ' · РАСХОД ОСТАНОВЛЕН' : over ? ' · ВЫШЕ ЁМКОСТИ' : !hasReading ? ' · НЕ УКАЗАНО' : percent <= 15 ? ' · МАЛО' : ''}`;
     });
   }
   const style = document.createElement('style');
@@ -31502,8 +31704,10 @@ if (location.protocol === 'file:') {
      .vpb-level-scale span:before{content:'';position:absolute;right:17px;top:3px;width:7px;border-top:1px solid #64748b99}
      .vpb-water{--vpb-main:#0ea5e9;--vpb-deep:#075985}.vpb-water .vpb-liquid{box-shadow:0 -3px 10px #0369a155}
       .vpb-running .vpb-liquid-surface,.vpb-paused .vpb-liquid-surface{animation:none}
-     .vpb-visual-low{--vpb-main:#ef4444;--vpb-deep:#991b1b;border-color:#ef4444;box-shadow:0 0 0 3px #fecaca99,0 7px 13px #0f172a18}
-     .vpb-visual-low .vpb-level-guide:after{background:#fee2e2;color:#991b1b}
+      .vpb-visual-low{--vpb-main:#eab308;--vpb-deep:#a16207;border-color:#eab308;box-shadow:0 0 0 3px #fef08a99,0 7px 13px #0f172a18}
+      .vpb-visual-low .vpb-level-guide:after{background:#fef9c3;color:#854d0e}
+      .vpb-visual-zero{--vpb-main:#ef4444;--vpb-deep:#991b1b;border-color:#ef4444;box-shadow:0 0 0 3px #fecaca99,0 7px 13px #0f172a18}
+      .vpb-visual-zero .vpb-level-guide:after{background:#fee2e2;color:#991b1b}
      .vpb-bucket-mark{position:absolute;z-index:8;left:12px;right:30px;top:47%;transform:translateY(-50%);display:flex;align-items:center;justify-content:center;color:#fff;font-size:16px;letter-spacing:-.04em;font-weight:950;text-shadow:0 1px 3px #0f172a99;pointer-events:none}
      .vpb-fill-label{position:absolute;z-index:8;left:8px;right:29px;bottom:8px;text-align:center;color:#ffffffd9;font-size:7px;font-weight:950;letter-spacing:.16em;text-shadow:0 1px 2px #0f172a99;pointer-events:none}
      .vpb-visual-caption{display:flex;flex-direction:column;gap:5px;min-width:100px;font-size:11px;line-height:1.25;color:#334155;font-weight:700}
@@ -31641,26 +31845,28 @@ if (location.protocol === 'file:') {
     const age = Date.now() - num(s.updatedAt);
     const stale = age > 180000;
     const total = (s.buckets || []).reduce((sum, b) => sum + Math.max(0, num(b.currentKg)), 0);
+    const zero = (s.buckets || []).filter(b => num(b.currentKg) <= 0).length;
     const low = (s.buckets || []).filter(b => {
       const cap = Math.max(0.1, num(b.capacityKg, s.paintType === 'water' ? 40 : 250));
-      return num(b.currentKg) <= Math.max(num(b.rateKgPer1000) * 0.9648, cap * 0.15);
+       return num(b.currentKg) > 0 && num(b.currentKg) <= Math.max(num(b.rateKgPer1000) * 0.9648, cap * 0.15);
     }).length;
     const minutes = (s.buckets || []).map(b => s.speed > 0 && num(b.rateKgPer1000) > 0 ? num(b.currentKg) / num(b.rateKgPer1000) * 1000 / s.speed : null).filter(x => x != null && x >= 0);
     const soon = minutes.length ? Math.min(...minutes) : null;
-    const status = stale ? '⚪ нет свежего сигнала' : (s.running ? '🟢 линия работает' : '⏸ линия остановлена');
+    const status = stale ? '⚪ нет свежего сигнала' : (zero ? '⛔ расход остановлен' : (s.running ? '🟢 линия работает' : '⏸ линия остановлена'));
     const typeSummary = [...new Set((s.buckets || []).map(b => b.paintType === 'water' ? 'водная' : 'пластизольная'))].join(' + ');
     const bucketHtml = (s.buckets || []).map(b => {
       const cap = Math.max(0.1, num(b.capacityKg, s.paintType === 'water' ? 40 : 250));
       const current = Math.max(0, num(b.currentKg)), pct = Math.max(0, Math.min(100, current / cap * 100));
-      const isLow = current <= Math.max(num(b.rateKgPer1000) * 0.9648, cap * 0.15);
-      return `<div class="vpd-mini"><div><span>С${b.section}</span><b>${round(current, 2)} кг</b></div><i class="${isLow ? 'vpd-mini-low' : ''}" style="width:${pct}%"></i></div>`;
+       const isZero = current <= 0;
+       const isLow = !isZero && current <= Math.max(num(b.rateKgPer1000) * 0.9648, cap * 0.15);
+       return `<div class="vpd-mini"><div><span>С${b.section}</span><b>${round(current, 2)} кг</b></div><i class="${isZero ? 'vpd-mini-zero' : isLow ? 'vpd-mini-low' : ''}" style="width:${pct}%"></i></div>`;
     }).join('');
     return `<article class="vpd-line-card ${stale ? 'vpd-stale' : ''}">
-       <div class="vpd-line-head"><div><b>Линия ${esc(s.line)}</b><span>${esc(s.article || 'артикул не указан')} · ${esc(typeSummary || 'тип не указан')}</span></div><strong>${status}</strong></div>
+       <div class="vpd-line-head"><div><b>Линия ${esc(s.line)}</b><span>${esc(s.article || 'артикул не указан')} · ${esc(typeSummary || 'тип не указан')}</span></div><strong class="${zero ? 'vpd-danger' : low ? 'vpd-warning' : ''}">${status}</strong></div>
       <div class="vpd-stats"><div><b>${round(total, 2)} кг</b><span>остаток всего</span></div><div><b>${s.speed > 0 ? round(s.speed, 1) : '—'}</b><span>м/мин</span></div><div><b>${soon == null ? '—' : round(soon / 60, 1) + ' ч'}</b><span>до малого остатка</span></div><div><b>${s.avgKgPer1000m > 0 ? round(s.avgKgPer1000m, 2) : '—'}</b><span>кг/1000 м факт</span></div></div>
       <div class="vpd-progress"><i style="width:${Math.max(0, Math.min(100, num(s.progress)))}%"></i></div><div class="vpd-progress-label">Палета: ${round(num(s.progress), 1)}% · готово палет: ${round(num(s.completedPallets), 0)}${s.pendingPallets ? ` · 🔔 отметить: ${s.pendingPallets}` : ''}</div>
       <div class="vpd-buckets">${bucketHtml}</div>
-      <div class="vpd-foot">${low ? `⚠️ Низкий остаток в секциях: ${low}` : '✅ Критически низких остатков нет'} · замеров: ${s.samples || 0} · обновлено ${stamp(s.updatedAt)}${stale ? ' · проверьте связь или линию' : ''}</div>
+      <div class="vpd-foot">${zero ? `⛔ Расход остановлен в секциях: ${zero}` : low ? `⚠️ Низкий остаток в секциях: ${low}` : '✅ Критически низких остатков нет'} · замеров: ${s.samples || 0} · обновлено ${stamp(s.updatedAt)}${stale ? ' · проверьте связь или линию' : ''}</div>
     </article>`;
   }
   async function renderDashboard() {
@@ -31694,7 +31900,7 @@ if (location.protocol === 'file:') {
     #vpd-modal.vpd-hidden,.vpd-hidden{display:none!important}
     #vpd-sheet{width:min(980px,100%);max-height:94vh;overflow:auto;background:#f1f5f9;border-radius:24px;padding:16px;color:#0f172a;font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;box-shadow:0 20px 60px #0006}
     .vpd-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.vpd-title{font-size:18px;font-weight:950;letter-spacing:-.04em}.vpd-close{border:0;background:#dbeafe;border-radius:12px;padding:8px 11px;font-size:18px;cursor:pointer}
-    .vpd-note,.vpd-summary{background:#fff;border:1px solid #dbeafe;border-radius:14px;padding:10px;font-size:10px;line-height:1.4;margin-top:10px}.vpd-summary{font-size:11px}.vpd-red{color:#dc2626}.vpd-line-card{background:#fff;border:1px solid #dbeafe;border-radius:17px;padding:12px;margin-top:10px}.vpd-stale{opacity:.72;border-color:#cbd5e1}.vpd-line-head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.vpd-line-head b{font-size:14px}.vpd-line-head span,.vpd-line-head strong{display:block;font-size:9px;color:#64748b;margin-top:3px}.vpd-line-head strong{color:#0f766e;text-align:right}.vpd-stale .vpd-line-head strong{color:#64748b}.vpd-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:10px}.vpd-stats div{background:#f8fafc;border-radius:10px;padding:7px}.vpd-stats b,.vpd-stats span{display:block}.vpd-stats b{font-size:13px}.vpd-stats span{font-size:8px;color:#64748b;margin-top:2px}.vpd-progress{height:7px;background:#e2e8f0;border-radius:99px;overflow:hidden;margin-top:10px}.vpd-progress i{display:block;height:100%;background:#2563eb;border-radius:99px}.vpd-progress-label,.vpd-foot{font-size:9px;color:#64748b;margin-top:4px}.vpd-buckets{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:10px}.vpd-mini{font-size:9px}.vpd-mini div{display:flex;justify-content:space-between;gap:3px}.vpd-mini b{font-size:9px}.vpd-mini>i{display:block;height:6px;background:#14b8a6;border-radius:99px;margin-top:3px}.vpd-mini>i.vpd-mini-low{background:#ef4444}.vpd-empty{text-align:center;color:#64748b;background:#fff;border-radius:14px;padding:22px;font-size:11px;margin-top:10px}
+    .vpd-note,.vpd-summary{background:#fff;border:1px solid #dbeafe;border-radius:14px;padding:10px;font-size:10px;line-height:1.4;margin-top:10px}.vpd-summary{font-size:11px}.vpd-red{color:#dc2626}.vpd-danger{color:#dc2626!important}.vpd-warning{color:#a16207!important}.vpd-line-card{background:#fff;border:1px solid #dbeafe;border-radius:17px;padding:12px;margin-top:10px}.vpd-stale{opacity:.72;border-color:#cbd5e1}.vpd-line-head{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}.vpd-line-head b{font-size:14px}.vpd-line-head span,.vpd-line-head strong{display:block;font-size:9px;color:#64748b;margin-top:3px}.vpd-line-head strong{color:#0f766e;text-align:right}.vpd-stale .vpd-line-head strong{color:#64748b}.vpd-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:10px}.vpd-stats div{background:#f8fafc;border-radius:10px;padding:7px}.vpd-stats b,.vpd-stats span{display:block}.vpd-stats b{font-size:13px}.vpd-stats span{font-size:8px;color:#64748b;margin-top:2px}.vpd-progress{height:7px;background:#e2e8f0;border-radius:99px;overflow:hidden;margin-top:10px}.vpd-progress i{display:block;height:100%;background:#2563eb;border-radius:99px}.vpd-progress-label,.vpd-foot{font-size:9px;color:#64748b;margin-top:4px}.vpd-buckets{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:10px}.vpd-mini{font-size:9px}.vpd-mini div{display:flex;justify-content:space-between;gap:3px}.vpd-mini b{font-size:9px}.vpd-mini>i{display:block;height:6px;background:#14b8a6;border-radius:99px;margin-top:3px}.vpd-mini>i.vpd-mini-low{background:#eab308}.vpd-mini>i.vpd-mini-zero{background:#ef4444}.vpd-empty{text-align:center;color:#64748b;background:#fff;border-radius:14px;padding:22px;font-size:11px;margin-top:10px}
     @media(max-width:560px){#vpd-fab{right:10px;bottom:calc(176px + env(safe-area-inset-bottom));padding:10px 12px}.vpd-stats{grid-template-columns:repeat(2,1fr)}.vpd-buckets{grid-template-columns:repeat(2,1fr)}}
   `;
   document.head.appendChild(style);
@@ -31775,6 +31981,194 @@ if (location.protocol === 'file:') {
   const timer = setInterval(applyPermissions, 500);
   window.addEventListener('beforeunload', () => clearInterval(timer));
   applyPermissions();
+})();
+</script>
+<script>
+/* ===== Мобильный UX + реалистичные бочки =====
+   На iPhone плавающие кнопки не должны закрывать активное поле ввода.
+   Визуальные ёмкости стилизованы под широкие белые производственные вёдра
+   с фотографии: конический корпус, овальный борт и деревянная палета. */
+(function () {
+  'use strict';
+
+  const floating = [
+    '#vpb-fab',
+    '#vpd-fab',
+    '#aspect-copilot-fab',
+    '#shift-traffic-light',
+    '#shift-traffic-panel'
+  ];
+  const hiddenFloating = [
+    ...floating.map(selector => `body.aspect-form-focused ${selector}`),
+    ...floating.map(selector => `body.aspect-paint-modal-open ${selector}`)
+  ].join(',\n');
+  const formSelector = 'input, select, textarea, [contenteditable="true"]';
+
+  function isFormElement(el) {
+    return !!(el && el.matches && el.matches(formSelector));
+  }
+
+  function syncMobileState() {
+    const active = document.activeElement;
+    const formFocused = isFormElement(active);
+    const modalOpen = ['#vpb-modal', '#vpd-modal'].some(selector => {
+      const el = document.querySelector(selector);
+      return el && !el.classList.contains('vpb-hidden') && !el.classList.contains('vpd-hidden') && !el.classList.contains('hidden');
+    });
+    document.body.classList.toggle('aspect-form-focused', formFocused);
+    document.body.classList.toggle('aspect-paint-modal-open', modalOpen);
+  }
+
+  document.addEventListener('focusin', syncMobileState, true);
+  document.addEventListener('focusout', () => setTimeout(syncMobileState, 80), true);
+  document.addEventListener('click', () => setTimeout(syncMobileState, 50), true);
+  window.addEventListener('resize', syncMobileState, { passive: true });
+  window.addEventListener('orientationchange', syncMobileState, { passive: true });
+  if (window.visualViewport) window.visualViewport.addEventListener('resize', syncMobileState, { passive: true });
+  setInterval(syncMobileState, 700);
+  syncMobileState();
+
+  const style = document.createElement('style');
+  style.textContent = `
+    /* Не заслоняем поля и клавиатурную панель на телефоне. */
+    ${hiddenFloating} {
+      opacity: 0 !important;
+      pointer-events: none !important;
+      transform: translateY(8px) scale(.92) !important;
+      transition: opacity .18s ease, transform .18s ease !important;
+    }
+
+    /* Бочка как на фото: белый широкий конусный пластиковый бак на палете. */
+    .vpb-visual-line {
+      position: relative;
+      align-items: flex-end;
+      overflow: visible;
+      padding-bottom: 13px !important;
+    }
+    .vpb-visual-line::before {
+      content: '';
+      position: absolute;
+      z-index: 0;
+      left: 8px;
+      bottom: 2px;
+      width: 138px;
+      height: 11px;
+      border-radius: 2px;
+      background:
+        repeating-linear-gradient(90deg, #8d6a4b 0 17px, #b28a61 17px 20px),
+        linear-gradient(#c29a70, #76563d);
+      box-shadow: 0 3px 2px #0f172a22, 0 0 0 1px #67493655;
+      transform: perspective(180px) rotateX(7deg);
+    }
+    .vpb-visual-bucket {
+      z-index: 1;
+      width: 132px !important;
+      height: 126px !important;
+      flex-basis: 132px !important;
+      border: 2px solid #b7c1c0 !important;
+      border-radius: 49% 49% 13% 13% / 13% 13% 8% 8% !important;
+      background:
+        linear-gradient(90deg, #d6dcd9 0%, #fafcf8 12%, #ffffff 35%, #edf1ed 72%, #c6ceca 100%) !important;
+      box-shadow:
+        inset 10px 0 18px #ffffffcc,
+        inset -11px -8px 18px #47556924,
+        0 7px 12px #0f172a26 !important;
+      transform: perspective(260px) rotateX(1deg);
+    }
+    .vpb-visual-bucket::before {
+      left: -2px !important;
+      right: -2px !important;
+      top: -2px !important;
+      height: 24px !important;
+      border: 4px solid #aeb9b7 !important;
+      border-radius: 50% !important;
+      background: linear-gradient(180deg, #ffffffdd, #dfe6e2aa) !important;
+      box-shadow: 0 2px 2px #0f172a26, inset 0 3px 5px #0f172a25 !important;
+    }
+    .vpb-visual-bucket::after {
+      border-radius: inherit !important;
+      box-shadow:
+        inset 4px 0 0 #ffffffc9,
+        inset -4px 0 #47556925,
+        inset 0 -8px 0 #89948e18 !important;
+    }
+    .vpb-liquid {
+      left: 6px !important;
+      right: 6px !important;
+      bottom: 5px !important;
+      border-radius: 0 0 13% 13% !important;
+      animation: vpb-liquid-breathe 2.7s ease-in-out infinite;
+      will-change: height, filter;
+    }
+    .vpb-liquid::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      opacity: .2;
+      background:
+        radial-gradient(circle at 18% 86%, #fff 0 1px, transparent 2px),
+        radial-gradient(circle at 62% 63%, #fff 0 1.5px, transparent 2.5px),
+        radial-gradient(circle at 42% 30%, #fff 0 1px, transparent 2px),
+        radial-gradient(circle at 82% 74%, #fff 0 1px, transparent 2px);
+      background-size: 34px 52px, 47px 68px, 39px 57px, 53px 61px;
+      animation: vpb-bubbles 3.8s linear infinite;
+      pointer-events: none;
+    }
+    .vpb-liquid-surface {
+      animation: vpb-slosh 1.8s ease-in-out infinite !important;
+      transform-origin: center;
+      will-change: transform, border-radius;
+    }
+    .vpb-shine {
+      animation: vpb-shine 3.2s ease-in-out infinite;
+      will-change: transform, opacity;
+    }
+    .vpb-running .vpb-visual-bucket::before {
+      animation: vpb-rim-glint 2.8s ease-in-out infinite;
+    }
+    .vpb-paused .vpb-liquid,
+    .vpb-paused .vpb-liquid::after,
+    .vpb-paused .vpb-liquid-surface,
+    .vpb-paused .vpb-shine,
+    .vpb-paused .vpb-visual-bucket::before {
+      animation-play-state: paused !important;
+    }
+    .vpb-visual-zero .vpb-liquid,
+    .vpb-visual-zero .vpb-liquid::after,
+    .vpb-visual-zero .vpb-liquid-surface {
+      animation-duration: 4.8s;
+      opacity: .75;
+    }
+    @keyframes vpb-slosh {
+      0%, 100% { transform: translateX(-4px) rotate(-1.5deg) scaleX(1.02); border-radius: 48% 52% 45% 55%; }
+      50% { transform: translateX(4px) rotate(1.5deg) scaleX(.98); border-radius: 55% 45% 54% 46%; }
+    }
+    @keyframes vpb-liquid-breathe {
+      0%, 100% { filter: saturate(1) brightness(1); }
+      50% { filter: saturate(1.12) brightness(1.08); }
+    }
+    @keyframes vpb-bubbles {
+      from { background-position: 0 12px, 0 20px, 0 8px, 0 16px; }
+      to { background-position: 0 -42px, 0 -48px, 0 -49px, 0 -45px; }
+    }
+    @keyframes vpb-shine {
+      0%, 100% { transform: translateX(0); opacity: .58; }
+      50% { transform: translateX(8px); opacity: .95; }
+    }
+    @keyframes vpb-rim-glint {
+      0%, 100% { box-shadow: 0 2px 2px #0f172a26, inset 0 3px 5px #0f172a25; }
+      50% { box-shadow: 0 2px 5px #0f172a30, inset 0 3px 7px #ffffffdd; }
+    }
+    @media (max-width: 560px) {
+      .vpb-visual-line::before { left: 5px; width: 124px; }
+      .vpb-visual-bucket { width: 118px !important; height: 114px !important; flex-basis: 118px !important; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .vpb-liquid, .vpb-liquid::after, .vpb-liquid-surface, .vpb-shine,
+      .vpb-running .vpb-visual-bucket::before { animation: none !important; }
+    }
+  `;
+  document.head.appendChild(style);
 })();
 </script>
 </body>
